@@ -44,7 +44,6 @@ import (
 	"github.com/apernet/hysteria/extras/v2/masq"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
-	"github.com/apernet/hysteria/extras/v2/realm"
 	"github.com/apernet/hysteria/extras/v2/sniff"
 	"github.com/apernet/hysteria/extras/v2/trafficlogger"
 	eUtils "github.com/apernet/hysteria/extras/v2/utils"
@@ -65,6 +64,7 @@ func init() {
 }
 
 type serverConfig struct {
+	V2board               *v2boardConfig              `mapstructure:"v2board"`
 	Listen                string                      `mapstructure:"listen"`
 	Realm                 serverConfigRealm           `mapstructure:"realm"`
 	Obfs                  serverConfigObfs            `mapstructure:"obfs"`
@@ -95,6 +95,14 @@ type serverConfigRealm struct {
 	Insecure          bool                   `mapstructure:"insecure"`
 	IPMode            string                 `mapstructure:"ipMode"`
 	PortMapping       realmPortMappingConfig `mapstructure:"portMapping"`
+}
+
+type v2boardConfig struct {
+	ApiHost      string        `mapstructure:"apiHost"`
+	ApiKey       string        `mapstructure:"apiKey"`
+	NodeID       uint          `mapstructure:"nodeID"`
+	PullInterval time.Duration `mapstructure:"pullInterval"`
+	PushInterval time.Duration `mapstructure:"pushInterval"`
 }
 
 type serverConfigObfsSalamander struct {
@@ -1439,6 +1447,14 @@ func (c *serverConfig) fillAuthenticator(hyConfig *server.Config) error {
 		}
 		hyConfig.Authenticator = &auth.CommandAuthenticator{Cmd: c.Auth.Command}
 		return nil
+	case "v2board":
+		v2boardConfig := c.V2board
+		if v2boardConfig.ApiHost == "" || v2boardConfig.ApiKey == "" || v2boardConfig.NodeID == 0 {
+			return configError{Field: "auth.v2board", Err: errors.New("v2board config error")}
+		}
+		hyConfig.Authenticator = &auth.V2boardApiProvider{URL: fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/user", c.V2board.ApiKey, c.V2board.NodeID)}
+
+		return nil
 	default:
 		return configError{Field: "auth.type", Err: errors.New("unsupported auth type")}
 	}
@@ -1450,11 +1466,28 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 }
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
+	pullInterval := time.Second * 5
+	if c.V2board.PullInterval > 0 {
+		pullInterval = time.Duration(c.V2board.PullInterval) * time.Second
+	}
+	pushInterval := time.Second * 60
+	if c.V2board.PushInterval > 0 {
+		pushInterval = time.Duration(c.V2board.PushInterval) * time.Second
+	}
+	userURL := fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/user", c.V2board.ApiKey, c.V2board.NodeID)
+	pushURL := fmt.Sprintf("%s?token=%s&node_id=%d&node_type=hysteria", c.V2board.ApiHost+"/api/v1/server/UniProxy/push", c.V2board.ApiKey, c.V2board.NodeID)
 	if c.TrafficStats.Listen != "" {
 		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
 		hyConfig.TrafficLogger = tss
+		if c.V2board != nil && c.V2board.ApiHost != "" {
+			go auth.UpdateUsers(userURL, pullInterval, hyConfig.TrafficLogger)
+			go hyConfig.TrafficLogger.PushTrafficToV2boardInterval(pushURL, pushInterval)
+		}
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
+	} else {
+		go auth.UpdateUsers(userURL, pullInterval, nil)
 	}
+
 	return nil
 }
 
@@ -1593,6 +1626,19 @@ func (c *serverConfig) Config() (*server.Config, error) {
 	return hyConfig, nil
 }
 
+type ResponseNodeInfo struct {
+	Host       string `json:"host"`
+	ServerPort uint   `json:"server_port"`
+	ServerName string `json:"server_name"`
+	UpMbps     uint   `json:"down_mbps"`
+	DownMbps   uint   `json:"up_mbps"`
+	Obfs       string `json:"obfs"`
+	BaseConfig struct {
+		PushInterval int `json:"push_interval"`
+		PullInterval int `json:"pull_interval"`
+	} `json:"base_config"`
+}
+
 func runServerCmd(cmd *cobra.Command, args []string) {
 	logger.Info("server mode")
 	runServer(defaultViper)
@@ -1605,6 +1651,48 @@ func runServer(v *viper.Viper) {
 	var config serverConfig
 	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse server config", zap.Error(err))
+	}
+	// 如果配置了v2board 则自动获取监听端口、obfs
+	if config.V2board != nil && config.V2board.ApiHost != "" {
+		// 创建一个url.Values来存储查询参数
+		queryParams := url.Values{
+			"token":     {config.V2board.ApiKey},
+			"node_id":   {strconv.Itoa(int(config.V2board.NodeID))},
+			"node_type": {"hysteria"},
+		}
+		nodeInfoUrl := config.V2board.ApiHost + "/api/v1/server/UniProxy/config?" + queryParams.Encode()
+		resp, err := http.Get(nodeInfoUrl)
+		if err != nil {
+			// 处理错误
+			fmt.Println("HTTP GET 请求出错:", err)
+			logger.Fatal("failed to client v2board api to get nodeInfo", zap.Error(err))
+		}
+		defer resp.Body.Close()
+		// 读取响应数据
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Fatal("failed to read v2board reaponse", zap.Error(err))
+		}
+		// 解析JSON数据
+		var responseNodeInfo ResponseNodeInfo
+		err = json.Unmarshal(body, &responseNodeInfo)
+		if err != nil {
+			logger.Fatal("failed to unmarshal v2board reaponse", zap.Error(err))
+		}
+		// 给 hy的端口、obfs、上行下行进行赋值
+		if responseNodeInfo.ServerPort != 0 {
+			config.Listen = ":" + strconv.Itoa(int(responseNodeInfo.ServerPort))
+		}
+		if responseNodeInfo.DownMbps != 0 {
+			config.Bandwidth.Down = strconv.Itoa(int(responseNodeInfo.DownMbps)) + "Mbps"
+		}
+		if responseNodeInfo.UpMbps != 0 {
+			config.Bandwidth.Up = strconv.Itoa(int(responseNodeInfo.UpMbps)) + "Mbps"
+		}
+		if responseNodeInfo.Obfs != "" {
+			config.Obfs.Type = "salamander"
+			config.Obfs.Salamander.Password = responseNodeInfo.Obfs
+		}
 	}
 	hyConfig, err := config.Config()
 	if err != nil {

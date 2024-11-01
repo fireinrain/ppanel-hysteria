@@ -13,7 +13,6 @@ import (
 	"github.com/apernet/hysteria/core/v2/internal/congestion"
 	"github.com/apernet/hysteria/core/v2/internal/pmtud"
 	"github.com/apernet/hysteria/core/v2/internal/utils"
-	"github.com/apernet/quic-go"
 )
 
 const (
@@ -31,7 +30,6 @@ type Config struct {
 	Cleanup               io.Closer
 	RequestHook           RequestHook
 	Outbound              Outbound
-	CongestionConfig      CongestionConfig
 	BandwidthConfig       BandwidthConfig
 	IgnoreClientBandwidth bool
 	DisableUDP            bool
@@ -257,6 +255,8 @@ type TrafficLogger interface {
 	LogOnlineState(id string, online bool)
 	TraceStream(stream HyStream, stats *StreamStats)
 	UntraceStream(stream HyStream)
+	PushTrafficToV2boardInterval(url string, interval time.Duration)
+	NewKick(id string) (ok bool)
 }
 
 type StreamState int
